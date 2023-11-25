@@ -1,4 +1,4 @@
-PS. Kuna arhiivifail on liiga suur, et giti laadida, siis tuleks see ise igalühel omas arvutis siia projekti juurde lisada (zip fail lahti pakkida ja peaks olema jsoni kujul), see peaks olema alamkaustas 'data'.
+PS. Kuna arhiivifail on liiga suur, et giti laadida, siis tuleks see ise igalühel omas arvutis siia projekti juurde lisada (zip fail lahti pakkida ja peaks olema jsoni kujul), see peaks olema alamkaustas 'project/data'.
 
 Use `docker compose up -d` to start up the necessary services.  
     To stop services:  
