@@ -111,6 +111,7 @@ services:
     restart: always
     ports:
       - 5588:5588
+      - 5432:5432
 
   pgadmin:
     container_name: pgadmin_project

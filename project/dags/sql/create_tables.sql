@@ -2,11 +2,15 @@ CREATE TABLE IF NOT EXISTS article (
     ID SERIAL PRIMARY KEY,
     article_id VARCHAR(25),
     title VARCHAR(255), 
-    doi VARCHAR(100),
+    doi VARCHAR(255),
     update_date VARCHAR(25),
-    journal_ref VARCHAR(100),
-    category_id VARCHAR(100),
+    journal_ref VARCHAR(255),
+    category_id INTEGER,
     url VARCHAR(150),
+    type VARCHAR(150),
+    reference_count INTEGER,
+    is_referenced_by_count INTEGER,
+    references_doi VARCHAR(150) ARRAY,
     UNIQUE (article_id, update_date)
 );
 

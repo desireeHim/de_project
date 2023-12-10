@@ -1,0 +1,7 @@
+.DS_Store
+project/data
+project/logs
+project/dags/__pycache__
+project/dags/sql/insert_*
+project/neo4j
+project/tmp
