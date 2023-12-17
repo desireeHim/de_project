@@ -2,10 +2,10 @@ from airflow import DAG
 from airflow.operators.python_operator import PythonOperator, BranchPythonOperator
 from airflow.operators.bash_operator import BashOperator 
 from airflow.operators.dummy_operator import DummyOperator
+from airflow.providers.neo4j.hooks.neo4j import Neo4jHook
 from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.contrib.sensors.file_sensor import FileSensor
 from datetime import datetime, timedelta
-#%pip install requests
 import requests
 import json
 
@@ -74,6 +74,12 @@ def getArticleResource(output_folder):
                 obj['reference_count'] = data.get('reference-count')
                 obj['references_doi'] = [ref['DOI'] for ref in data.get('reference', []) if 'DOI' in ref]
                 obj['is_referenced_by_count'] = data.get('is-referenced-by-count')
+                
+                if obj['type'] == 'journal-article':
+                    issns = data.get('ISSN', [])
+                    obj['journal_issn'] = issns[0] if len(issns) > 0 else None
+                    journal_names = data.get('container-title', [])
+                    obj['journal_name'] = journal_names[0] if len(journal_names) > 0 else None
 
         augmented_data.append(obj)
 
@@ -132,7 +138,7 @@ file_sensor = FileSensor(
 
 first_task >> file_sensor
 
-second_task = PythonOperator(
+augment_data_task = PythonOperator(
     task_id='augment_data',
     dag=dag,
     trigger_rule='none_failed',
@@ -149,9 +155,9 @@ delete_src_file = BashOperator(
     dag=dag,
 )
 
-file_sensor >> second_task
+file_sensor >> augment_data_task
 
-second_task >> delete_src_file
+augment_data_task >> delete_src_file
 
 def insert_categories(output_folder):
     data = []
@@ -159,7 +165,7 @@ def insert_categories(output_folder):
         if not line:
             continue
         data.append(json.loads(line))
-    sql_file = ''
+    sql_file = 'SELECT 1;\n'
     unique_cat = set()
 
     for row in data:
@@ -194,6 +200,25 @@ def insert_authors(output_folder):
         f.write(sql_file)
 
 
+def insert_journals(output_folder):
+    data = []
+    for line in open(f'{output_folder}/augmented_data.json', 'r', encoding='utf-8', errors="replace"):
+        if not line:
+            continue
+        data.append(json.loads(line))
+    sql_file = 'SELECT 1;\n'
+    unique_issns = set()
+
+    for row in data:
+        issn = row.get('journal_issn')
+        name = row.get('journal_name')
+        if issn and issn not in unique_issns:
+            sql_file = sql_file + f'INSERT INTO journal (issn, name) VALUES (\'{escape(issn)}\', \'{escape(name)}\') ON CONFLICT (issn) DO NOTHING;\n'
+            unique_issns.add(issn)
+    with open(f'dags/sql/insert_journals.sql', 'w', encoding='utf-8', errors="replace") as f:
+        f.write(sql_file)
+
+
 def insert_articles(output_folder):
     data = []
     for line in open(f'{output_folder}/augmented_data.json', 'r', encoding='utf-8', errors="replace"):
@@ -204,7 +229,7 @@ def insert_articles(output_folder):
     
     for row in data:
         sql_file = sql_file + f"""
-        INSERT INTO article (article_id, title, doi, update_date, journal_ref, category_id, type, reference_count, is_referenced_by_count, references_doi)
+        INSERT INTO article (article_id, title, doi, update_date, journal_ref, category_id, journal_id, type, reference_count, is_referenced_by_count, references_doi)
         VALUES (
             '{row['id']}',
             '{escape(row['title'])}',
@@ -212,6 +237,7 @@ def insert_articles(output_folder):
             '{row.get('update_date')}',
             '{ifnull(escape(row.get('journal-ref')))}',
             (SELECT ID FROM category WHERE name = '{row.get("categories")}'),
+            (SELECT ID FROM journal WHERE issn = '{row.get("journal_issn")}'),
             '{ifnull(row.get('type'))}',
             {ifnull(row.get('reference_count'))},
             {ifnull(row.get('is_referenced_by_count'))},
@@ -251,9 +277,9 @@ create_tables = PostgresOperator(
     autocommit=True,
 )
 
-second_task >> create_tables
+augment_data_task >> create_tables
 
-third_task = PythonOperator(
+insert_categories_task = PythonOperator(
     task_id='insert_categories',
     dag=dag,
     trigger_rule='none_failed',
@@ -263,9 +289,9 @@ third_task = PythonOperator(
     },
 )
 
-create_tables >> third_task
+create_tables >> insert_categories_task
 
-fourth_task = PostgresOperator(
+insert_categories_to_db_task = PostgresOperator(
     task_id='insert_categories_to_db',
     dag=dag,
     postgres_conn_id='airflow_pg',
@@ -274,9 +300,9 @@ fourth_task = PostgresOperator(
     autocommit=True,
 )
 
-third_task >> fourth_task
+insert_categories_task >> insert_categories_to_db_task
 
-fifth_task = PythonOperator(
+insert_authors_task = PythonOperator(
     task_id='insert_authors',
     dag=dag,
     trigger_rule='none_failed',
@@ -286,9 +312,9 @@ fifth_task = PythonOperator(
     },
 )
 
-fourth_task >> fifth_task
+insert_categories_to_db_task >> insert_authors_task
 
-sixth_task = PostgresOperator(
+insert_authors_to_db_task = PostgresOperator(
     task_id='insert_authors_to_db',
     dag=dag,
     postgres_conn_id='airflow_pg',
@@ -297,9 +323,32 @@ sixth_task = PostgresOperator(
     autocommit=True,
 )
 
-fifth_task >> sixth_task
+insert_authors_task >> insert_authors_to_db_task
 
-seventh_task = PythonOperator(
+insert_journals_task = PythonOperator(
+    task_id = 'insert_journals',
+    dag=dag,
+    trigger_rule='none_failed',
+    python_callable=insert_journals,
+    op_kwargs={
+        'output_folder': DATA_FOLDER,
+    },
+)
+
+insert_authors_to_db_task >> insert_journals_task
+
+insert_journals_to_db_task = PostgresOperator(
+    task_id='insert_journals_to_db',
+    dag=dag,
+    postgres_conn_id='airflow_pg',
+    sql='sql/insert_journals.sql',
+    trigger_rule='none_failed',
+    autocommit=True,
+)
+
+insert_journals_task >> insert_journals_to_db_task
+
+insert_articles_task = PythonOperator(
     task_id='insert_articles',
     dag=dag,
     trigger_rule='none_failed',
@@ -309,9 +358,9 @@ seventh_task = PythonOperator(
     },
 )
 
-sixth_task >> seventh_task
+insert_journals_to_db_task >> insert_articles_task
 
-eightth_task = PostgresOperator(
+insert_articles_to_db_task = PostgresOperator(
     task_id='insert_articles_to_db',
     dag=dag,
     postgres_conn_id='airflow_pg',
@@ -320,9 +369,9 @@ eightth_task = PostgresOperator(
     autocommit=True,
 )
 
-seventh_task >> eightth_task
+insert_articles_task >> insert_articles_to_db_task
 
-ninth_task = PythonOperator(
+insert_article_author_task = PythonOperator(
     task_id='insert_article_author',
     dag=dag,
     trigger_rule='none_failed',
@@ -332,9 +381,9 @@ ninth_task = PythonOperator(
     },
 )
 
-eightth_task >> ninth_task
+insert_articles_to_db_task >> insert_article_author_task
 
-tenth_task = PostgresOperator(
+insert_article_authors_to_db_task = PostgresOperator(
     task_id='insert_article_authors_to_db',
     dag=dag,
     postgres_conn_id='airflow_pg',
@@ -343,4 +392,40 @@ tenth_task = PostgresOperator(
     autocommit=True,
 )
 
-ninth_task >> tenth_task
+insert_article_author_task >> insert_article_authors_to_db_task
+
+def run_neo4j_query(cypher_query):
+    hook = Neo4jHook(conn_id='airflow_neo4j')
+    return hook.run(cypher_query)
+
+
+def insert_authors_to_graph(output_folder):
+    unique_authors = set()
+    for line in open(f'{output_folder}/augmented_data.json', 'r', encoding='utf-8', errors="replace"):
+        if not line:
+            continue
+        obj = json.loads(line)
+
+        authors = obj.get("authors_parsed", [])
+        for author in authors:
+            if author[1] + author[0] not in unique_authors:
+                run_neo4j_query(
+                    'MERGE (a:Author {first_name: "%(first_name)s", last_name: "%(last_name)s"})' % {
+                        "first_name": author[1],
+                        "last_name": author[0],
+                    }
+                )
+                unique_authors.add(author[1] + author[0])
+
+
+insert_authors_to_graph_task = PythonOperator(
+    task_id='insert_authors_to_graph',
+    dag=dag,
+    trigger_rule='none_failed',
+    python_callable=insert_authors_to_graph,
+    op_kwargs={
+        'output_folder': DATA_FOLDER,
+    },
+)
+
+augment_data_task >> insert_authors_to_graph_task

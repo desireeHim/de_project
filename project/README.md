@@ -19,7 +19,7 @@ For SQL create in dags folder subfolder 'sql' and move a copy of sql there.
 
 This DAG has a connection to a Postgres database. Thus, before we can successfully execute the DAG, we need to set up the connection. This can be done in the Airflow UI.
 
-### Airflow
+### Airflow Postgres connection
 
 From the top menu, navigate to Admin -> Connections.
 
@@ -38,6 +38,15 @@ You can test the connection. If it works, click on Save.
 You also have to add connection for file system for File Sensor DAG.
 
 Connection name is "data_path" and type is File (path)
+
+### Airflow Neo4j connection
+Likewise, add a Neo4j connection of type `Neo4j`
+
+Name the connection_id `airflow_neo4j`.
+- Host: neo4j
+- port: 7687
+- login: neo4j
+- password: admin
 
 ### PgAdmin
 
