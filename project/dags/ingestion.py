@@ -3,12 +3,20 @@ from airflow.operators.python_operator import PythonOperator, BranchPythonOperat
 from airflow.operators.bash_operator import BashOperator 
 from airflow.operators.dummy_operator import DummyOperator
 from airflow.providers.neo4j.hooks.neo4j import Neo4jHook
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.contrib.sensors.file_sensor import FileSensor
 from datetime import datetime, timedelta
 import requests
 import json
 
+ARTICLES_TO_READ = 100
+
+
+def sql_query(query):
+    postgres_hook = PostgresHook(postgres_conn_id='airflow_pg')
+    result = postgres_hook.get_records(query)
+    return result
 
 
 def read_in_data(output_folder):
@@ -18,19 +26,30 @@ def read_in_data(output_folder):
         obj = json.loads(line)
         i = i + 1
 
-        # data cleaning example: "droping" data with one word titles
+        if i >= ARTICLES_TO_READ:  # you can change the limit of reading in data objects by changing the ARTICLES_TO_READ value
+            break
+
+        # skipping the articles that have already been read during the previous runs
+        record_exists = len(sql_query(f"SELECT 1 FROM article WHERE article_id = '{obj['id']}'")) > 0
+        if record_exists:
+            continue
+
+        # data cleansing
+        ## "dropping" data with one word titles
         if len(obj['title'].split(" ")) == 1:
             continue
 
+        ## dropping data with empty authors list
+        if not obj.get('authors'):
+            continue
+        
         data.append(obj)
-        if i == 10:  # you can change the limit of reading in data objects by changing the number in if- condition
-            break
+
     
     ## if everything went well this line should print out the first element of the list
     #print(json.dumps(data[0], indent=2))   
     
     modified_data = []
-    # TODO: add data cleaning
     ## line by line data modification
     for obj in data:
         obj.pop('abstract')
@@ -44,9 +63,14 @@ def read_in_data(output_folder):
 
 def getArticleResource(output_folder):
     augmented_data = []
+    i = 0
     for line in open('/data/staging/cleaned_data.json', 'r', encoding='utf-8', errors="replace"):
         if not line:
             continue
+        if i % 50 == 0:
+            print(f'Augmenting article {i} ...')
+        i += 1
+
         obj = json.loads(line)
 
         # augment from dblp database
@@ -186,7 +210,7 @@ def insert_authors(output_folder):
         if not line:
             continue
         data.append(json.loads(line))
-    sql_file = ''
+    sql_file = 'SELECT 1;\n'
     unique_authors = set()
 
     for row in data:
@@ -225,7 +249,7 @@ def insert_articles(output_folder):
         if not line:
             continue
         data.append(json.loads(line))
-    sql_file = ''
+    sql_file = 'SELECT 1;\n'
     
     for row in data:
         sql_file = sql_file + f"""
@@ -233,7 +257,7 @@ def insert_articles(output_folder):
         VALUES (
             '{row['id']}',
             '{escape(row['title'])}',
-            '{ifnull(row.get('doi'))}',
+            '{ifnull(escape(row.get('doi')))}',
             '{row.get('update_date')}',
             '{ifnull(escape(row.get('journal-ref')))}',
             (SELECT ID FROM category WHERE name = '{row.get("categories")}'),
@@ -241,7 +265,7 @@ def insert_articles(output_folder):
             '{ifnull(row.get('type'))}',
             {ifnull(row.get('reference_count'))},
             {ifnull(row.get('is_referenced_by_count'))},
-            {'array[' if row.get('references_doi') else 'NULL'} {','.join([f"'{doi}'" for doi in row.get('references_doi', [])])} {']' if row.get('references_doi') else ''}
+            {'array[' if row.get('references_doi') else 'NULL'} {','.join([f"'{escape(doi)}'" for doi in row.get('references_doi', [])])} {']' if row.get('references_doi') else ''}
         )
         ON CONFLICT (article_id, update_date) DO NOTHING;\n
         """
@@ -256,7 +280,7 @@ def insert_articles_authors(output_folder):
         if not line:
             continue
         data.append(json.loads(line))
-    sql_file = ''
+    sql_file = 'SELECT 1;\n'
     
     for row in data:
         authors = row.get("authors_parsed")
@@ -398,6 +422,41 @@ def run_neo4j_query(cypher_query):
     hook = Neo4jHook(conn_id='airflow_neo4j')
     return hook.run(cypher_query)
 
+def insert_categories_to_graph(output_folder):
+    unique_categories = set()
+    for line in open(f'{output_folder}/augmented_data.json', 'r', encoding='utf-8', errors="replace"):
+        if not line:
+            continue
+        obj = json.loads(line)
+
+        categories = obj.get("categories")
+        if categories and categories not in unique_categories:
+            run_neo4j_query(
+                'MERGE (c:Category {name: "%(categories)s"})' % {
+                    "categories": categories,
+                }
+            )
+            unique_categories.add(categories)
+
+
+def insert_journals_to_graph(output_folder):
+    unique_issns = set()
+    for line in open(f'{output_folder}/augmented_data.json', 'r', encoding='utf-8', errors="replace"):
+        if not line:
+            continue
+        obj = json.loads(line)
+
+        issn = obj.get('journal_issn')
+        name = obj.get('journal_name')
+        if issn and issn not in unique_issns:
+            run_neo4j_query(
+                'MERGE (j:Journal {issn: "%(issn)s", name: "%(name)s"})' % {
+                    "issn": issn,
+                    "name": name,
+                }
+            )
+            unique_issns.add(issn)
+
 
 def insert_authors_to_graph(output_folder):
     unique_authors = set()
@@ -411,12 +470,117 @@ def insert_authors_to_graph(output_folder):
             if author[1] + author[0] not in unique_authors:
                 run_neo4j_query(
                     'MERGE (a:Author {first_name: "%(first_name)s", last_name: "%(last_name)s"})' % {
-                        "first_name": author[1],
-                        "last_name": author[0],
+                        "first_name": author[1].replace('"',"'"),
+                        "last_name": author[0].replace('"',"'"),
                     }
                 )
                 unique_authors.add(author[1] + author[0])
 
+def insert_articles_to_graph(output_folder):
+    for line in open(f'{output_folder}/augmented_data.json', 'r', encoding='utf-8', errors="replace"):
+        if not line:
+            continue
+        obj = json.loads(line)
+        query = '''
+            MERGE (a:Article {article_id: "%(article_id)s"})
+            ON CREATE
+            SET a.title = "%(title)s",
+                a.doi = %(doi)s,
+                a.update_date = "%(update_date)s",
+                a.journal_ref = %(journal_ref)s,
+                a.type = %(type)s,
+                a.reference_count = %(reference_count)s,
+                a.is_referenced_by_count = %(is_referenced_by_count)s
+        ''' % {
+            "article_id": obj['id'],
+            "title": escape(obj['title']).replace('"',"'"),
+            "doi": '"' + escape(obj.get('doi')) + '"' if obj.get('doi') else 'null',
+            "update_date": obj['update_date'],
+            "journal_ref": '"' + escape(obj.get('journal_ref')) + '"' if obj.get('journal_ref') else 'null',
+            "type": '"' + escape(obj.get('type')) + '"' if obj.get('journal_ref') else 'null',
+            "reference_count": obj.get('reference_count') if obj.get('reference_count') is not None else 'null',
+            "is_referenced_by_count": obj.get('is_referenced_by_count') if obj.get('is_referenced_by_count') is not None else 'null',
+        }
+        if obj.get('journal_issn'):
+            query += '''
+                WITH a
+                MATCH (j:Journal {issn: "%(journal_issn)s"})
+                MERGE (a)-[:PUBLISHED_IN]->(j)
+            ''' % {
+                "journal_issn": obj['journal_issn']
+            }
+        if obj.get('categories'):
+            query += '''
+                WITH a
+                MATCH (c:Category {name: "%(name)s"})
+                MERGE (a)-[:BELONGS_TO]->(c)
+            ''' % {
+                "name": obj['categories']
+            }
+        authors = []
+        for author in obj['authors_parsed']:
+            authors.append(
+                '{first_name: "%(first_name)s", last_name: "%(last_name)s"}' % {
+                    "first_name": author[1].replace('"',"'"),
+                    "last_name": author[0].replace('"',"'"),
+                }
+            )
+        query += '''
+            WITH a, [%(authors)s] as authors
+            UNWIND authors as author
+            MATCH (au:Author {first_name: author.first_name, last_name: author.last_name})
+            MERGE (a)-[:AUTHORED_BY]->(au)
+        ''' % {
+            "authors": ',\n'.join(authors)
+        }
+        run_neo4j_query(query)
+
+
+def insert_article_references_to_graph(output_folder):
+    for line in open(f'{output_folder}/augmented_data.json', 'r', encoding='utf-8', errors="replace"):
+        if not line:
+            continue
+        obj = json.loads(line)
+        doi = obj.get('doi')
+        references = obj.get('references_doi')
+        if not doi or not references:
+            continue
+        references_list = ', '.join([f'"{ref}"' for ref in references])
+        query = '''
+            WITH [%(references_list)s] as dois
+            UNWIND dois as doi2
+            MATCH (a1:Article {doi: "%(doi)s"}), (a2:Article {doi: doi2})
+            MERGE (a1)-[:REFERENCES]->(a2)
+        ''' % {
+            "references_list": references_list,
+            "doi": escape(doi)
+        }
+        run_neo4j_query(query)
+        
+
+insert_categories_to_graph_task = PythonOperator(
+    task_id='insert_categories_to_graph',
+    dag=dag,
+    trigger_rule='none_failed',
+    python_callable=insert_categories_to_graph,
+    op_kwargs={
+        'output_folder': DATA_FOLDER,
+    },
+)
+
+augment_data_task >> insert_categories_to_graph_task
+
+insert_journals_to_graph_task = PythonOperator(
+    task_id='insert_journals_to_graph',
+    dag=dag,
+    trigger_rule='none_failed',
+    python_callable=insert_journals_to_graph,
+    op_kwargs={
+        'output_folder': DATA_FOLDER,
+    },
+)
+
+insert_categories_to_graph_task >> insert_journals_to_graph_task
 
 insert_authors_to_graph_task = PythonOperator(
     task_id='insert_authors_to_graph',
@@ -428,4 +592,28 @@ insert_authors_to_graph_task = PythonOperator(
     },
 )
 
-augment_data_task >> insert_authors_to_graph_task
+insert_journals_to_graph_task >> insert_authors_to_graph_task
+
+insert_articles_to_graph_task = PythonOperator(
+    task_id='insert_articles_to_graph',
+    dag=dag,
+    trigger_rule='none_failed',
+    python_callable=insert_articles_to_graph,
+    op_kwargs={
+        'output_folder': DATA_FOLDER,
+    },
+)
+
+insert_authors_to_graph_task >> insert_articles_to_graph_task
+
+insert_article_references_to_graph_task = PythonOperator(
+    task_id='insert_article_references_to_graph',
+    dag=dag,
+    trigger_rule='none_failed',
+    python_callable=insert_article_references_to_graph,
+    op_kwargs={
+        'output_folder': DATA_FOLDER,
+    },
+)
+
+insert_articles_to_graph_task >> insert_article_references_to_graph_task
