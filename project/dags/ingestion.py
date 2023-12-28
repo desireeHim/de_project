@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 import requests
 import json
 
-ARTICLES_TO_READ = 100
+ARTICLES_TO_READ = 1000
 
 
 def sql_query(query):
@@ -30,9 +30,9 @@ def read_in_data(output_folder):
             break
 
         # skipping the articles that have already been read during the previous runs
-        record_exists = len(sql_query(f"SELECT 1 FROM article WHERE article_id = '{obj['id']}'")) > 0
-        if record_exists:
-            continue
+        # record_exists = len(sql_query(f"SELECT 1 FROM article WHERE article_id = '{obj['id']}'")) > 0
+        # if record_exists:
+        #    continue
 
         # data cleansing
         ## "dropping" data with one word titles
