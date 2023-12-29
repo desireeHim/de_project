@@ -326,6 +326,7 @@ services:
       - ./neo4j:/data
     environment:
       - NEO4J_AUTH=neo4j/admin
+      - NEO4JLABS_PLUGINS=["graph-data-science"]
 
 volumes:
   postgres-db-volume:
